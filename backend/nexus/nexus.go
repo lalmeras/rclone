@@ -129,7 +129,7 @@ type ListCallbackFunc func(item ListAssetsItemResponse) error
 func (f *Fs) QueryAssets(ctx context.Context, repository string, callback ListCallbackFunc) error {
 	opts := rest.Opts{
 		Method:            "GET",
-		Path:              "service/rest/v1/assets",
+		Path:              "/service/rest/v1/assets",
 		RootURL:           f.opt.Endpoint,
 		UserName:          f.opt.Username,
 		Password:          f.opt.Password,
