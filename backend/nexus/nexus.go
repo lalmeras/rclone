@@ -16,6 +16,7 @@ import (
 	"github.com/rclone/rclone/fs/config/configstruct"
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/fs/walk"
 	"github.com/rclone/rclone/lib/cache"
 	"github.com/rclone/rclone/lib/bucket"
 	"github.com/rclone/rclone/lib/rest"
@@ -30,15 +31,15 @@ func init() {
 		NewFs:       NewFs,
 		Options: []fs.Option{{
 			Name:     "username",
-			Help:     "Account username",
+			Help:     "Nexus username",
 			Required: true,
 		}, {
 			Name:     "password",
-			Help:     "Application password",
+			Help:     "Nexus password",
 			Required: true,
 		}, {
 			Name:     "endpoint",
-			Help:     "Endpoint for the service.",
+			Help:     "Endpoint for the service (https://nexus.host).",
 			Advanced: true,
 		}},
 	})
@@ -80,6 +81,8 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		WriteMimeType:     true,
 		BucketBased:       true,
 		BucketBasedRootOK: true,
+		SlowModTime:       true,
+		CanHaveEmptyDirectories: false,
 	}).Fill(ctx, f)
 	fs.Debugf(f, "Creating FS %s, repository %s", f.Name(), f.Repository())
 	fs.Debugf(f, "Using username %s, URL %s", f.opt.Username, f.opt.Endpoint)
@@ -122,6 +125,56 @@ func (f *Fs) Hashes() hash.Set {
 
 func (f *Fs) split(rootRelativePath string) (repository, absolutePath string) {
 	return bucket.Split(path.Join(f.root, rootRelativePath))
+}
+
+func (f *Fs) ListR(ctx context.Context, repository string, callback fs.ListRCallback) error {
+	fs.Debugf(f, "ListR")
+	repository = "eclipse"
+	opts := rest.Opts{
+		Method:            "GET",
+		Path:              "/service/rest/v1/assets",
+		RootURL:           f.opt.Endpoint,
+		UserName:          f.opt.Username,
+		Password:          f.opt.Password,
+		Parameters:        url.Values{},
+	}
+	opts.Parameters.Set("repository", repository)
+	items := new(ListAssetsResponse)
+	done := false
+	for ! done {
+		items = new(ListAssetsResponse)
+		fs.Debugf(f, "Query")
+		// perform query
+		f.client.CallJSON(ctx, &opts, nil, &items)
+		var entries fs.DirEntries
+		for _, item := range items.Items {
+			// process file
+			o := &Object{
+				remote: path.Join(repository, item.Path),
+				modTime: time.Now(),
+			}
+			fs.Debugf(f, o.Remote())
+			entries = append(entries, o)
+		}
+		callback(entries)
+		if items.ContinuationToken == nil {
+			break
+		}
+		opts.Parameters.Set("continuationToken", *items.ContinuationToken)
+		fs.Debugf(f, "Continuing with %s", *items.ContinuationToken)
+	}
+	return nil
+}
+
+func (f *Fs) List(ctx context.Context, relativeDir string) (entries fs.DirEntries, err error) {
+	_, directory := f.split(relativeDir)
+	fs.Debugf(f, "List")
+	dirtree, _ := walk.NewDirTree(ctx, f, "", true, -1)
+	fs.Debugf(f, directory)
+	fs.Debugf(f, relativeDir)
+	entries = dirtree["eclipse"]
+	fs.Debugf(f, "%s", entries)
+	return
 }
 
 type ListCallbackFunc func(item ListAssetsItemResponse) error
@@ -284,7 +337,7 @@ func (f *Fs) Recurse(base string, cacheKey string, recurse bool) (entries fs.Dir
 	return entries
 }
 
-func (f *Fs) List(ctx context.Context, relativeDir string) (entries fs.DirEntries, err error) {
+func (f *Fs) List2(ctx context.Context, relativeDir string) (entries fs.DirEntries, err error) {
 	repository, directory := f.split(relativeDir)
 	_, found := f.cache.GetMaybe(repository)
 	if ! found {
