@@ -26,6 +26,7 @@ require (
 	github.com/dropbox/dropbox-sdk-go-unofficial v1.0.1-0.20210114204226-41fdcdae8a53
 	github.com/gabriel-vasile/mimetype v1.2.0
 	github.com/go-chi/chi/v5 v5.0.2
+	github.com/go-delve/delve v1.7.0 // indirect
 	github.com/go-ole/go-ole v1.2.5 // indirect
 	github.com/golang/groupcache v0.0.0-20210331224755-41bb18bfe9da // indirect
 	github.com/google/go-querystring v1.1.0 // indirect
@@ -81,6 +82,8 @@ require (
 	google.golang.org/api v0.44.0
 	google.golang.org/genproto v0.0.0-20210416161957-9910b6c460de // indirect
 	google.golang.org/grpc v1.37.0 // indirect
+	gopkg.in/airbrake/gobrake.v2 v2.0.9 // indirect
+	gopkg.in/gemnasium/logrus-airbrake-hook.v2 v2.1.2 // indirect
 	gopkg.in/yaml.v2 v2.4.0
 	gopkg.in/yaml.v3 v3.0.0-20210107192922-496545a6307b // indirect
 	storj.io/common v0.0.0-20210419115916-eabb53ea1332 // indirect

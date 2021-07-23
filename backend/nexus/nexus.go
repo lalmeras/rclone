@@ -3,25 +3,25 @@ package nexus
 import (
 	"context"
 	"fmt"
-	"path/filepath"
 	"io"
 	"net/http"
 	"net/url"
 	"path"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
+	"github.com/rclone/rclone/fs/dirtree"
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
-	"github.com/rclone/rclone/fs/walk"
-	"github.com/rclone/rclone/lib/cache"
 	"github.com/rclone/rclone/lib/bucket"
+	"github.com/rclone/rclone/lib/errors"
 	"github.com/rclone/rclone/lib/rest"
 )
-
 
 // Register with Fs
 func init() {
@@ -46,20 +46,20 @@ func init() {
 }
 
 type Options struct {
-	Username        string               `config:"username"`
-	Password        string               `config:"password"`
-	Endpoint        string               `config:"endpoint"`
+	Username string `config:"username"`
+	Password string `config:"password"`
+	Endpoint string `config:"endpoint"`
 }
 
 type Fs struct {
-	name            string
-	root            string
-	repository      string
-	path            string
-	opt             Options
-	client          *rest.Client
-	features        *fs.Features
-	cache           *cache.Cache
+	name       string
+	root       string
+	repository string
+	path       string
+	opt        Options
+	client     *rest.Client
+	features   *fs.Features
+	dirtree    *dirtree.DirTree
 }
 
 // NewFs constructs an Fs from the path, bucket:path
@@ -70,18 +70,18 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		return nil, err
 	}
 	f := &Fs{
-		name:       name,
-		client:     rest.NewClient(fshttp.NewClient(ctx)).SetErrorHandler(errorHandler),
-		opt:        *opt,
-		cache:      cache.New(),
+		name:    name,
+		client:  rest.NewClient(fshttp.NewClient(ctx)).SetErrorHandler(errorHandler),
+		opt:     *opt,
+		dirtree: nil,
 	}
 	f.setLocation(root)
 	f.features = (&fs.Features{
-		ReadMimeType:      true,
-		WriteMimeType:     true,
-		BucketBased:       true,
-		BucketBasedRootOK: true,
-		SlowModTime:       true,
+		ReadMimeType:            true,
+		WriteMimeType:           true,
+		BucketBased:             true,
+		BucketBasedRootOK:       true,
+		SlowModTime:             true,
 		CanHaveEmptyDirectories: false,
 	}).Fill(ctx, f)
 	fs.Debugf(f, "Creating FS %s, repository %s", f.Name(), f.Repository())
@@ -120,41 +120,34 @@ func (f *Fs) Features() *fs.Features {
 
 // Hashes returns the supported hash sets.
 func (f *Fs) Hashes() hash.Set {
-	return hash.Set(hash.SHA1)
+	return hash.NewHashSet(hash.SHA1, hash.MD5)
 }
 
 func (f *Fs) split(rootRelativePath string) (repository, absolutePath string) {
 	return bucket.Split(path.Join(f.root, rootRelativePath))
 }
 
-func (f *Fs) ListR(ctx context.Context, repository string, callback fs.ListRCallback) error {
-	fs.Debugf(f, "ListR")
-	repository = "eclipse"
+func (f *Fs) listR(ctx context.Context, relativeDir string, callback fs.ListRCallback) error {
+	repository, _ := f.split(relativeDir)
 	opts := rest.Opts{
-		Method:            "GET",
-		Path:              "/service/rest/v1/assets",
-		RootURL:           f.opt.Endpoint,
-		UserName:          f.opt.Username,
-		Password:          f.opt.Password,
-		Parameters:        url.Values{},
+		Method:     "GET",
+		Path:       "/service/rest/v1/assets",
+		RootURL:    f.opt.Endpoint,
+		UserName:   f.opt.Username,
+		Password:   f.opt.Password,
+		Parameters: url.Values{},
 	}
 	opts.Parameters.Set("repository", repository)
 	items := new(ListAssetsResponse)
 	done := false
-	for ! done {
+	for !done {
 		items = new(ListAssetsResponse)
 		fs.Debugf(f, "Query")
 		// perform query
 		f.client.CallJSON(ctx, &opts, nil, &items)
 		var entries fs.DirEntries
 		for _, item := range items.Items {
-			// process file
-			o := &Object{
-				remote: path.Join(repository, item.Path),
-				modTime: time.Now(),
-			}
-			fs.Debugf(f, o.Remote())
-			entries = append(entries, o)
+			entries = append(entries, f.itemToObject(ctx, repository, item))
 		}
 		callback(entries)
 		if items.ContinuationToken == nil {
@@ -166,187 +159,120 @@ func (f *Fs) ListR(ctx context.Context, repository string, callback fs.ListRCall
 	return nil
 }
 
+func (f *Fs) itemToObject(ctx context.Context, repository string, item ListAssetsItemResponse) (object fs.Object) {
+	opts := rest.Opts{
+		Method:     "GET",
+		Path:       "/service/rest/v1/assets/" + item.Id,
+		RootURL:    f.opt.Endpoint,
+		UserName:   f.opt.Username,
+		Password:   f.opt.Password,
+		Parameters: url.Values{},
+	}
+	asset := new(AssetResponse)
+	f.client.CallJSON(ctx, &opts, nil, &asset)
+	fs.Debugf(f, asset.DownloadUrl)
+	sizeOpts := rest.Opts{
+		Method:     "HEAD",
+		RootURL:    asset.DownloadUrl,
+		Path:       "",
+		UserName:   f.opt.Username,
+		Password:   f.opt.Password,
+		Parameters: url.Values{},
+	}
+	response, _ := f.client.Call(ctx, &sizeOpts)
+	fs.Debugf(f, "%s", response)
+	// process file
+	object = &Object{
+		remote:  path.Join(repository, item.Path),
+		modTime: asset.LastModified,
+		checksum: Checksum{
+			Md5:  asset.Checksum.Md5,
+			Sha1: asset.Checksum.Sha1,
+		},
+		size: response.ContentLength,
+	}
+	return object
+}
+
 func (f *Fs) List(ctx context.Context, relativeDir string) (entries fs.DirEntries, err error) {
-	_, directory := f.split(relativeDir)
-	fs.Debugf(f, "List")
-	dirtree, _ := walk.NewDirTree(ctx, f, "", true, -1)
-	fs.Debugf(f, directory)
-	fs.Debugf(f, relativeDir)
-	entries = dirtree["eclipse"]
+	repository, directory := f.split(relativeDir)
+	fullpath := path.Join(repository, directory)
+	fs.Debugf(f, "List %s %s", relativeDir, f.root)
+	f.walkRDirTree(ctx, repository)
+	cached := (*f.dirtree)[fullpath]
+	for _, entry := range cached {
+		rel, _ := filepath.Rel(f.root, entry.Remote())
+		fs.Debugf(f, "Entry %s", rel)
+		if d, ok := entry.(fs.Directory); ok {
+			relocated := fs.NewDir(rel, d.ModTime(ctx))
+			relocated.SetItems(d.Items())
+			entries = append(entries, relocated)
+		} else if o, ok := entry.(NexusObject); ok {
+			relocated := &Object{
+				fs:       f,
+				remote:   rel,
+				modTime:  o.ModTime(ctx),
+				size:     o.Size(),
+				checksum: o.Checksum(),
+			}
+			entries = append(entries, relocated)
+		}
+	}
 	fs.Debugf(f, "%s", entries)
 	return
 }
 
-type ListCallbackFunc func(item ListAssetsItemResponse) error
-
-func (f *Fs) QueryAssets(ctx context.Context, repository string, callback ListCallbackFunc) error {
-	opts := rest.Opts{
-		Method:            "GET",
-		Path:              "/service/rest/v1/assets",
-		RootURL:           f.opt.Endpoint,
-		UserName:          f.opt.Username,
-		Password:          f.opt.Password,
-		Parameters:        url.Values{},
+// copied and simplified from walk.go ; used to extrapolate dirs from file listing
+func (f *Fs) walkRDirTree(ctx context.Context, startPath string) error {
+	if f.dirtree != nil {
+		return nil
 	}
-	opts.Parameters.Set("repository", repository)
-	items := new(ListAssetsResponse)
-	done := false
-	for ! done {
-		items = new(ListAssetsResponse)
-		fs.Debugf(f, "Query")
-		// perform query
-		f.client.CallJSON(ctx, &opts, nil, &items)
-		for _, item := range items.Items {
-			callback(item)
-		}
-		if items.ContinuationToken == nil {
-			break
-		}
-		opts.Parameters.Set("continuationToken", *items.ContinuationToken)
-		fs.Debugf(f, "Continuing with %s", *items.ContinuationToken)
-	}
-	return nil
-}
-
-func Parent(fullpath string) (parent string, basename string) {
-	parent, basename = path.Split(fullpath)
-	parent = strings.Trim(parent, "/")
-	return
-}
-
-func (f *Fs) ConditionnalyUpdateParent(cacheEntry CacheItem, childpath string) error {
-	parentpath, _ := Parent(childpath)
-	childFound := false
-	for _, child := range cacheEntry.children {
-		if child == childpath {
-			childFound = true
-		}
-	}
-	if ! childFound {
-		cacheEntry.children = append(cacheEntry.children, childpath)
-		f.CachePut(parentpath, cacheEntry)
-	}
-	return nil
-}
-
-func (f *Fs) GetOrCacheDir(repository string, dirpath string, childpath string) (cacheEntry CacheItem) {
-	cacheKey := path.Join(repository, dirpath)
-	item, found := f.cache.GetMaybe(cacheKey)
-	if found {
-		cacheEntry = item.(CacheItem)
-		if childpath != repository {
-			f.ConditionnalyUpdateParent(cacheEntry, childpath)
-		}
-	} else {
-		dirEntry := fs.NewDir(cacheKey, time.Now())
-		cacheEntry = CacheItem{}
-		cacheEntry.directory = dirEntry
-		if childpath != repository {
-			cacheEntry.children = append(cacheEntry.children, childpath)
-		}
-		f.CachePut(dirEntry.Remote(), cacheEntry)
-	}
-	return cacheEntry
-}
-
-func (f *Fs) ProcessAssets(ctx context.Context, repository string) error {
-	return f.QueryAssets(ctx, repository, func (item ListAssetsItemResponse) error {
-		// all items are files
-		// dirs must be rebuilt and stored from file path
-
-		// set root entry
-		rootEntry := f.GetOrCacheDir(repository, "", repository)
-
-		// first process parent dirs
-		filedir, _ := Parent(item.Path)
-		dir := filedir
-		// last is the last processed dir
-		// used to get child each time we navigate to the root
-		last := path.Join(repository, item.Path)
-
-		// keep file directory
-		var filedirCacheEntry *CacheItem
-
-		// recurse all parents dirs until root
-		for dir != "" {
-			// cache dir, append child
-			dirCacheEntry := f.GetOrCacheDir(repository, dir, last)
-			// update last processed dir
-			last = path.Join(repository, dir)
-			// move to parent
-			dir, _ = Parent(dir)
-			// store filedir CacheItem
-			if filedirCacheEntry == nil {
-				filedirCacheEntry = &dirCacheEntry
-			}
-			if dir == "" {
-				f.GetOrCacheDir(repository, dir, last)
+	dirs := dirtree.New()
+	// Entries can come in arbitrary order. We use toPrune to keep
+	// all directories to exclude later.
+	toPrune := make(map[string]bool)
+	var mu sync.Mutex
+	err := f.listR(ctx, startPath, func(entries fs.DirEntries) error {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, entry := range entries {
+			switch x := entry.(type) {
+			case fs.Object:
+				dirs.Add(x)
+			case fs.Directory:
+				dirs.AddDir(x)
+			default:
+				return errors.Errorf("unknown object type %T", entry)
 			}
 		}
-		// if filedirCacheEntry not set, then root is the file parent
-		if filedirCacheEntry == nil {
-			filedirCacheEntry = &rootEntry
-		}
-		
-		// process file
-		o := &Object{
-			remote: path.Join(repository, item.Path),
-			modTime: time.Now(),
-		}
-		cacheEntry := CacheItem{}
-		cacheEntry.file = o
-		f.CachePut(o.Remote(), cacheEntry)
-		f.ConditionnalyUpdateParent(*filedirCacheEntry, o.Remote())
-
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	dirs.CheckParents(startPath)
+	if len(dirs) == 0 {
+		dirs[startPath] = nil
+	}
+	err = dirs.Prune(toPrune)
+	if err != nil {
+		return err
+	}
+	dirs.Sort()
+	f.dirtree = &dirs
+	return nil
 }
 
-func (f *Fs) CachePut(path string, item CacheItem) {
-	fs.Debugf(f, "Caching %s", path)
-	f.cache.Put(path, item)
+// parentDir finds the parent directory of path
+func parentDir(entryPath string) string {
+	dirPath := path.Dir(entryPath)
+	if dirPath == "." {
+		dirPath = ""
+	}
+	return dirPath
 }
 
-func (f *Fs) Recurse(base string, cacheKey string, recurse bool) (entries fs.DirEntries) {
-	entry, found := f.cache.GetMaybe(cacheKey)
-	if ! found {
-		fs.Debugf(f, "Not found %s", cacheKey)
-		return entries
-	}
-	item := entry.(CacheItem)
-	if ! recurse {
-		relpath, _ := filepath.Rel(base, cacheKey)
-		if item.directory != nil {
-			directory := fs.NewDir(relpath, time.Now())
-			entries = append(entries, directory)
-		} else if item.file != nil {
-			file := item.file
-			file.remote = relpath
-			entries = append(entries, file)
-		}
-	} else {
-		fs.Debugf(f, "recurse %s %s", cacheKey, item.children)
-		for _, child := range item.children {
-			recursed := f.Recurse(base, child, false)
-			for _, rec := range recursed {
-				entries = append(entries, rec)
-			}
-		}
-	}
-	fs.Debugf(f, "recurse %s", entries)
-	return entries
-}
-
-func (f *Fs) List2(ctx context.Context, relativeDir string) (entries fs.DirEntries, err error) {
-	repository, directory := f.split(relativeDir)
-	_, found := f.cache.GetMaybe(repository)
-	if ! found {
-		f.ProcessAssets(ctx, repository)
-	}
-	entries = f.Recurse(f.Root(), path.Join(repository, directory), true)
-	fs.Debugf(f, "recurse %s", entries)
-	return entries, nil
-}
+type ListCallbackFunc func(item ListAssetsItemResponse) error
 
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	return nil, nil
@@ -415,93 +341,103 @@ func (e *Error) Fatal() bool {
 }
 
 type Checksum struct {
-	Sha1               string             `json:"sha1"`
-	Md5                string             `json:"md5"`
+	Sha1 string `json:"sha1"`
+	Md5  string `json:"md5"`
 }
 
 type AssetResponse struct {
-	BlobCreated        time.Time          `json:"blobCreated"`
-	LastDownloaded     time.Time          `json:"lastDownloaded"`
-	LastModified       time.Time          `json:"lastModified"`
-	ContentType        string             `json:"contentType"`
+	BlobCreated    time.Time `json:"blobCreated"`
+	LastDownloaded time.Time `json:"lastDownloaded"`
+	LastModified   time.Time `json:"lastModified"`
+	ContentType    string    `json:"contentType"`
 
-	Id                 string             `json:"id"`
-	Checksum           Checksum           `json:"checksum"`
-	DownloadUrl        string             `json:"downloadUrl"`
-	Path               string             `json:"path"`
-	Repository         string             `json:"repository"`
-	Format             string             `json:"format"`
+	Id          string   `json:"id"`
+	Checksum    Checksum `json:"checksum"`
+	DownloadUrl string   `json:"downloadUrl"`
+	Path        string   `json:"path"`
+	Repository  string   `json:"repository"`
+	Format      string   `json:"format"`
 }
 
 type ListAssetsItemResponse struct {
-	Id                 string             `json:"id"`
-	DownloadUrl        string             `json:"downloadUrl"`
-	Path               string             `json:"path"`
-	Repository         string             `json:"repository"`
-	Format             string             `json:"format"`
-	Checksum           Checksum           `json:"checksum"`
+	Id          string   `json:"id"`
+	DownloadUrl string   `json:"downloadUrl"`
+	Path        string   `json:"path"`
+	Repository  string   `json:"repository"`
+	Format      string   `json:"format"`
+	Checksum    Checksum `json:"checksum"`
 }
 
 type ListAssetsResponse struct {
-	Items              []ListAssetsItemResponse    `json:"items"`
-	ContinuationToken  *string                      `json:"continuationToken"`
+	Items             []ListAssetsItemResponse `json:"items"`
+	ContinuationToken *string                  `json:"continuationToken"`
 }
 
 type Object struct {
-	fs                 *Fs
-	checksum           Checksum
-	remote             string
-	modTime            time.Time
-	size               int64
+	fs       *Fs
+	checksum Checksum
+	remote   string
+	modTime  time.Time
+	size     int64
+}
+
+type NexusObject interface {
+	fs.Object
+
+	Checksum() Checksum
 }
 
 type CacheItem struct {
-	directory          *fs.Dir
-	file               *Object
-	children           []string
+	directory *fs.Dir
+	file      *Object
+	children  []string
 }
 
-func (object* Object) String() string {
+func (object *Object) String() string {
 	return object.remote
 }
 
-func (object* Object) Remote() string {
+func (object *Object) Remote() string {
 	return object.remote
 }
 
-func (object* Object) ModTime(context.Context) time.Time {
+func (object *Object) ModTime(context.Context) time.Time {
 	return object.modTime
 }
 
-func (object* Object) Size() int64 {
+func (object *Object) Size() int64 {
 	return object.size
 }
 
-func (object* Object) Fs() fs.Info {
+func (object *Object) Fs() fs.Info {
 	return object.fs
 }
 
-func (object* Object) SetModTime(ctx context.Context, t time.Time) error {
+func (object *Object) SetModTime(ctx context.Context, t time.Time) error {
 	object.modTime = t
 	return nil
 }
 
-func (object* Object) Hash(ctx context.Context, ty hash.Type) (string, error) {
+func (object *Object) Checksum() Checksum {
+	return object.checksum
+}
+
+func (object *Object) Hash(ctx context.Context, ty hash.Type) (string, error) {
 	return object.checksum.Md5, nil
 }
 
-func (object* Object) Storable() bool {
+func (object *Object) Storable() bool {
 	return true
 }
 
-func (object* Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
+func (object *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
 	return nil, nil
 }
 
-func (object* Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
+func (object *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
 	return nil
 }
 
-func (object* Object) Remove(ctx context.Context) error {
+func (object *Object) Remove(ctx context.Context) error {
 	return nil
 }
