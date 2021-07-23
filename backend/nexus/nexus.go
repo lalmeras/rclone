@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/rclone/rclone/backend/pcloud/api"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
@@ -127,8 +128,10 @@ func (f *Fs) split(rootRelativePath string) (repository, absolutePath string) {
 	return bucket.Split(path.Join(f.root, rootRelativePath))
 }
 
-func (f *Fs) listR(ctx context.Context, relativeDir string, callback fs.ListRCallback) error {
-	repository, _ := f.split(relativeDir)
+// list a whole repository ; fs.ListRCallback consumes results and handles directory extrapolation
+// (directory are not listed)
+func (f *Fs) listR(ctx context.Context, repository string, callback fs.ListRCallback) error {
+	// common parameters
 	opts := rest.Opts{
 		Method:     "GET",
 		Path:       "/service/rest/v1/assets",
@@ -138,28 +141,36 @@ func (f *Fs) listR(ctx context.Context, relativeDir string, callback fs.ListRCal
 		Parameters: url.Values{},
 	}
 	opts.Parameters.Set("repository", repository)
-	items := new(ListAssetsResponse)
+	var items *ListAssetsResponse
+	var entries fs.DirEntries
 	done := false
 	for !done {
+		// perform until all results are retrieved
 		items = new(ListAssetsResponse)
-		fs.Debugf(f, "Query")
-		// perform query
+		// rest call
 		f.client.CallJSON(ctx, &opts, nil, &items)
-		var entries fs.DirEntries
 		for _, item := range items.Items {
+			// entries to objects (all results are file)
 			entries = append(entries, f.itemToObject(ctx, repository, item))
 		}
-		callback(entries)
+		// exit if no more page
 		if items.ContinuationToken == nil {
 			break
 		}
+		// update page parameter
 		opts.Parameters.Set("continuationToken", *items.ContinuationToken)
 		fs.Debugf(f, "Continuing with %s", *items.ContinuationToken)
 	}
+	callback(entries)
 	return nil
 }
 
+// transform REST results to Object (REST API only returns files)
+// Two additional calls are needed :
+// - GET /service/rest/v1/assets/{assetId} : modTime, checksums
+// - HEAD {asset.DownloadUrl} : size
 func (f *Fs) itemToObject(ctx context.Context, repository string, item ListAssetsItemResponse) (object fs.Object) {
+	// fetch data
 	opts := rest.Opts{
 		Method:     "GET",
 		Path:       "/service/rest/v1/assets/" + item.Id,
@@ -170,7 +181,6 @@ func (f *Fs) itemToObject(ctx context.Context, repository string, item ListAsset
 	}
 	asset := new(AssetResponse)
 	f.client.CallJSON(ctx, &opts, nil, &asset)
-	fs.Debugf(f, asset.DownloadUrl)
 	sizeOpts := rest.Opts{
 		Method:     "HEAD",
 		RootURL:    asset.DownloadUrl,
@@ -180,8 +190,8 @@ func (f *Fs) itemToObject(ctx context.Context, repository string, item ListAsset
 		Parameters: url.Values{},
 	}
 	response, _ := f.client.Call(ctx, &sizeOpts)
-	fs.Debugf(f, "%s", response)
-	// process file
+
+	// build Object
 	object = &Object{
 		remote:  path.Join(repository, item.Path),
 		modTime: asset.LastModified,
@@ -194,10 +204,12 @@ func (f *Fs) itemToObject(ctx context.Context, repository string, item ListAsset
 	return object
 }
 
+// perform a whole dir walk (walkRDirTree) then uses dirtree to construct expected
+// result. DirEntry are copied from DirTree, to allow remote rewrite relative to fs.root
 func (f *Fs) List(ctx context.Context, relativeDir string) (entries fs.DirEntries, err error) {
+	fs.Debugf(f, "List")
 	repository, directory := f.split(relativeDir)
 	fullpath := path.Join(repository, directory)
-	fs.Debugf(f, "List %s %s", relativeDir, f.root)
 	f.walkRDirTree(ctx, repository)
 	cached := (*f.dirtree)[fullpath]
 	for _, entry := range cached {
@@ -275,11 +287,45 @@ func parentDir(entryPath string) string {
 type ListCallbackFunc func(item ListAssetsItemResponse) error
 
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
-	return nil, nil
+	fs.Debugf(f, "NewObject")
+	repository, _ := f.split(remote)
+	f.walkRDirTree(ctx, repository)
+	_, i := f.dirtree.Find(remote)
+	o, ok := i.(fs.Object)
+	if i != nil && ok {
+		return o, nil
+	} else {
+		return nil, fs.ErrorObjectNotFound
+	}
 }
 
-func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	return nil, nil
+func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (object fs.Object, err error) {
+	fs.Debugf(f, "Put")
+	repository, directory := f.split(src.Remote())
+
+	size := src.Size() // NB can upload without size
+	var result api.UploadFileResponse
+	opts := rest.Opts{
+		Method:        "PUT",
+		RootURL:       f.opt.Endpoint,
+		Path:          "/repository/" + repository + "/" + directory,
+		Body:          in,
+		ContentType:   fs.MimeType(ctx, src),
+		ContentLength: &size,
+		Parameters:    url.Values{},
+		Options:       options,
+		UserName:      f.opt.Username,
+		Password:      f.opt.Password,
+	}
+	_, err = f.client.CallJSON(ctx, &opts, nil, &result)
+	f.dirtree = nil
+	object = &Object{
+		fs:      f,
+		remote:  src.Remote(),
+		size:    src.Size(),
+		modTime: src.ModTime(ctx),
+	}
+	return object, nil
 }
 
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
@@ -441,3 +487,7 @@ func (object *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInf
 func (object *Object) Remove(ctx context.Context) error {
 	return nil
 }
+
+var (
+	_ fs.Object = (*Object)(nil)
+)
